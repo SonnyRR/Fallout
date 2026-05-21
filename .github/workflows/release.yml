@@ -8,6 +8,10 @@ on:
   push:
     branches:
       - main
+    paths-ignore:
+      - 'docs/**'
+      - '.assets/**'
+      - '**/*.md'
 
 permissions:
   contents: write     # for ICreateGitHubRelease (tag + GitHub release)
