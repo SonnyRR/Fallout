@@ -114,9 +114,23 @@ public sealed class TransitionShimGenerator : IIncrementalGenerator
 
     private static void EmitShimsForMarker(SourceProductionContext ctx, Compilation compilation, ShimMarker marker)
     {
-        // The same logical type can be reached via multiple referenced assemblies
-        // (e.g. when an assembly type-forwards through another). Dedupe hint
-        // names so AddSource doesn't throw.
+        // Pre-pass: find type FQNs that are ambiguous across Fallout.* assemblies.
+        // If the same fully-qualified name exists in two different assemblies, a
+        // shim delegating to that name produces CS0433 at the consumer's compile.
+        // Skip those entirely.
+        var fqnCounts = new Dictionary<string, int>(StringComparer.Ordinal);
+        foreach (var assemblyRef in compilation.SourceModule.ReferencedAssemblySymbols)
+        {
+            if (!assemblyRef.Name.StartsWith("Fallout.", StringComparison.Ordinal))
+                continue;
+            CountFqnsInNamespace(assemblyRef.GlobalNamespace, marker, fqnCounts);
+        }
+        var ambiguous = new HashSet<string>(
+            fqnCounts.Where(kv => kv.Value > 1).Select(kv => kv.Key),
+            StringComparer.Ordinal);
+
+        // The same logical type can be reached via multiple referenced assemblies.
+        // Dedupe hint names so AddSource doesn't throw.
         var emittedHints = new HashSet<string>(StringComparer.Ordinal);
 
         foreach (var assemblyRef in compilation.SourceModule.ReferencedAssemblySymbols)
@@ -126,11 +140,28 @@ public sealed class TransitionShimGenerator : IIncrementalGenerator
             if (!assemblyRef.Name.StartsWith("Fallout.", StringComparison.Ordinal))
                 continue;
 
-            VisitNamespace(ctx, assemblyRef.GlobalNamespace, marker, emittedHints);
+            VisitNamespace(ctx, assemblyRef.GlobalNamespace, marker, emittedHints, ambiguous);
         }
     }
 
-    private static void VisitNamespace(SourceProductionContext ctx, INamespaceSymbol ns, ShimMarker marker, HashSet<string> emittedHints)
+    private static void CountFqnsInNamespace(INamespaceSymbol ns, ShimMarker marker, Dictionary<string, int> counts)
+    {
+        foreach (var type in ns.GetTypeMembers())
+        {
+            if (type.DeclaredAccessibility != Accessibility.Public) continue;
+            var fullNamespace = type.ContainingNamespace?.ToDisplayString() ?? string.Empty;
+            if (string.IsNullOrEmpty(fullNamespace)) continue;
+            var matches = fullNamespace == marker.FromPrefix
+                || fullNamespace.StartsWith(marker.FromPrefix + ".", StringComparison.Ordinal);
+            if (!matches) continue;
+            var fqn = type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat);
+            counts[fqn] = counts.TryGetValue(fqn, out var existing) ? existing + 1 : 1;
+        }
+        foreach (var child in ns.GetNamespaceMembers())
+            CountFqnsInNamespace(child, marker, counts);
+    }
+
+    private static void VisitNamespace(SourceProductionContext ctx, INamespaceSymbol ns, ShimMarker marker, HashSet<string> emittedHints, HashSet<string> ambiguousFqns)
     {
         foreach (var type in ns.GetTypeMembers())
         {
@@ -145,18 +176,29 @@ public sealed class TransitionShimGenerator : IIncrementalGenerator
                 || fullNamespace.StartsWith(marker.FromPrefix + ".", StringComparison.Ordinal);
             if (!matches) continue;
 
-            EmitOrSkipType(ctx, type, marker, emittedHints);
+            EmitOrSkipType(ctx, type, marker, emittedHints, ambiguousFqns);
         }
         foreach (var child in ns.GetNamespaceMembers())
-            VisitNamespace(ctx, child, marker, emittedHints);
+            VisitNamespace(ctx, child, marker, emittedHints, ambiguousFqns);
     }
 
-    private static void EmitOrSkipType(SourceProductionContext ctx, INamedTypeSymbol type, ShimMarker marker, HashSet<string> emittedHints)
+    private static void EmitOrSkipType(SourceProductionContext ctx, INamedTypeSymbol type, ShimMarker marker, HashSet<string> emittedHints, HashSet<string> ambiguousFqns)
     {
         // Skip nested types at top level — they get emitted inside their
         // declaring shim's source.
         if (type.ContainingType is not null)
             return;
+
+        var fqn = type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat);
+        if (ambiguousFqns.Contains(fqn))
+        {
+            ctx.ReportDiagnostic(Diagnostic.Create(
+                SkippedTypeRule,
+                location: Location.None,
+                type.ToDisplayString(),
+                "ambiguous-across-assemblies"));
+            return;
+        }
 
         var skipReason = ClassifyForSkip(type);
         if (skipReason is not null)
@@ -184,14 +226,15 @@ public sealed class TransitionShimGenerator : IIncrementalGenerator
     {
         if (type.TypeKind == TypeKind.Enum) return "enum";
         if (type.TypeKind == TypeKind.Delegate) return "delegate";
-        // Struct record skipped (session 2). Class record falls through as
-        // Easy tier — handled in EmitTypeBody.
+        // Class record falls through as Easy tier — handled in EmitTypeBody.
         if (type.TypeKind == TypeKind.Struct) return "struct";
-        if (type.IsStatic) return "static-class";
+        // Static classes are now session-2 supported via method-by-method
+        // delegation — no longer skipped.
         if (type.IsSealed && type.TypeKind == TypeKind.Class && !type.IsRecord) return "sealed-class";
         // For classes (interfaces don't have constructors), require at least one
         // public or protected instance ctor — otherwise we can't subclass cross-assembly.
-        if (type.TypeKind == TypeKind.Class && !HasAnyAccessibleInstanceCtor(type))
+        // Static classes don't apply here (they don't get instantiated).
+        if (type.TypeKind == TypeKind.Class && !type.IsStatic && !HasAnyAccessibleInstanceCtor(type))
             return "no-accessible-ctor";
         return null;
     }
@@ -240,32 +283,36 @@ public sealed class TransitionShimGenerator : IIncrementalGenerator
         // shadows a same-named nested type on the base (otherwise CS0108).
         // C# convention is `public new` order, not `new public`.
         var newKeyword = (type.ContainingType is not null && BaseHasNestedTypeNamed(type)) ? "new " : string.Empty;
-        var modifiers = type.TypeKind == TypeKind.Interface
-            ? $"public {newKeyword}partial"
-            : type.IsAbstract
-                ? $"public {newKeyword}abstract partial"
-                : $"public {newKeyword}partial";
+        string modifiers;
+        if (type.IsStatic)
+            modifiers = $"public {newKeyword}static partial";
+        else if (type.TypeKind == TypeKind.Interface)
+            modifiers = $"public {newKeyword}partial";
+        else if (type.IsAbstract)
+            modifiers = $"public {newKeyword}abstract partial";
+        else
+            modifiers = $"public {newKeyword}partial";
 
         // Records keep their record-ness so the inheritance rules line up.
         // "Only records may inherit from records" (CS8865).
-        var kind = type.TypeKind == TypeKind.Interface
-            ? "interface"
-            : type.IsRecord ? "record class" : "class";
+        string kind;
+        if (type.IsStatic)
+            kind = "class";  // static class
+        else if (type.TypeKind == TypeKind.Interface)
+            kind = "interface";
+        else if (type.IsRecord)
+            kind = "record class";
+        else
+            kind = "class";
 
         var genericParams = FormatGenericParameters(type);
         var canonicalFqn = FormatCanonicalReference(type);
 
         sb.Append(indent).Append(modifiers).Append(' ').Append(kind).Append(' ').Append(type.Name).Append(genericParams);
 
-        // Base type / interface
-        if (type.TypeKind == TypeKind.Interface)
-        {
+        // Static classes don't have a base type. Everything else inherits from the canonical.
+        if (!type.IsStatic)
             sb.Append(" : ").Append(canonicalFqn);
-        }
-        else
-        {
-            sb.Append(" : ").Append(canonicalFqn);
-        }
 
         // Generic constraints
         var constraints = FormatGenericConstraints(type);
@@ -278,9 +325,16 @@ public sealed class TransitionShimGenerator : IIncrementalGenerator
         sb.AppendLine();
         sb.Append(indent).AppendLine("{");
 
-        // Constructors (only for classes — interfaces don't have them)
-        if (type.TypeKind == TypeKind.Class)
+        // Constructors (only for non-static classes — interfaces / static classes don't have them)
+        if (type.TypeKind == TypeKind.Class && !type.IsStatic)
             EmitConstructors(sb, type, indentLevel + 1);
+
+        // Static method delegation (only for static classes).
+        // Non-static types inherit their instance methods from the canonical
+        // base. Static methods on regular classes are inherited too, so we
+        // don't redeclare those either.
+        if (type.IsStatic)
+            EmitStaticMethodDelegates(sb, type, indentLevel + 1);
 
         // Nested public types
         foreach (var nested in type.GetTypeMembers())
@@ -292,6 +346,67 @@ public sealed class TransitionShimGenerator : IIncrementalGenerator
         }
 
         sb.Append(indent).AppendLine("}");
+    }
+
+    private static void EmitStaticMethodDelegates(StringBuilder sb, INamedTypeSymbol type, int indentLevel)
+    {
+        var indent = new string(' ', indentLevel * 4);
+        var canonicalFqn = FormatCanonicalReference(type);
+        var emittedSig = new HashSet<string>(StringComparer.Ordinal);
+
+        foreach (var member in type.GetMembers())
+        {
+            if (member is not IMethodSymbol method) continue;
+            if (method.DeclaredAccessibility != Accessibility.Public) continue;
+            if (!method.IsStatic) continue;
+            if (method.MethodKind != MethodKind.Ordinary) continue;  // skip operators, accessors, etc.
+            if (method.IsImplicitlyDeclared) continue;
+
+            // Dedupe by signature so we don't emit two identical method
+            // delegations if the canonical has the same shape twice (shouldn't
+            // happen but defensive).
+            var sigKey = method.Name + "(" + string.Join(",", method.Parameters.Select(p => p.Type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat))) + ")";
+            if (!emittedSig.Add(sigKey)) continue;
+
+            EmitOneStaticMethodDelegate(sb, method, canonicalFqn, indent);
+        }
+    }
+
+    private static void EmitOneStaticMethodDelegate(StringBuilder sb, IMethodSymbol method, string canonicalFqn, string indent)
+    {
+        var returnType = method.ReturnsVoid
+            ? "void"
+            : method.ReturnType.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat);
+
+        var methodGenericParams = method.IsGenericMethod
+            ? "<" + string.Join(", ", method.TypeParameters.Select(tp => tp.Name)) + ">"
+            : string.Empty;
+
+        var paramStrings = method.Parameters.Select(FormatParameter).ToList();
+        if (method.IsExtensionMethod && paramStrings.Count > 0)
+            paramStrings[0] = "this " + paramStrings[0];
+        var parameterList = string.Join(", ", paramStrings);
+
+        var argumentList = string.Join(", ", method.Parameters.Select(p =>
+        {
+            var prefix = p.RefKind switch
+            {
+                RefKind.Ref => "ref ",
+                RefKind.Out => "out ",
+                RefKind.In => "in ",
+                _ => string.Empty,
+            };
+            return prefix + SafeIdentifier(p.Name);
+        }));
+
+        var constraints = FormatTypeParameterConstraints(method.TypeParameters);
+
+        sb.Append(indent).Append("public static ").Append(returnType).Append(' ').Append(method.Name)
+            .Append(methodGenericParams).Append('(').Append(parameterList).Append(')');
+        if (!string.IsNullOrEmpty(constraints))
+            sb.Append(' ').Append(constraints);
+        sb.Append(" => ").Append(canonicalFqn).Append('.').Append(method.Name).Append(methodGenericParams)
+            .Append('(').Append(argumentList).Append(");").AppendLine();
     }
 
     private static void EmitConstructors(StringBuilder sb, INamedTypeSymbol type, int indentLevel)
@@ -374,12 +489,15 @@ public sealed class TransitionShimGenerator : IIncrementalGenerator
     }
 
     private static string FormatGenericConstraints(INamedTypeSymbol type)
+        => FormatTypeParameterConstraints(type.TypeParameters);
+
+    private static string FormatTypeParameterConstraints(ImmutableArray<ITypeParameterSymbol> typeParameters)
     {
-        if (type.TypeParameters.IsDefaultOrEmpty || type.TypeParameters.Length == 0)
+        if (typeParameters.IsDefaultOrEmpty || typeParameters.Length == 0)
             return string.Empty;
 
         var clauses = new List<string>();
-        foreach (var tp in type.TypeParameters)
+        foreach (var tp in typeParameters)
         {
             var parts = new List<string>();
             if (tp.HasReferenceTypeConstraint) parts.Add("class");
@@ -438,10 +556,24 @@ public sealed class TransitionShimGenerator : IIncrementalGenerator
 
     private static string FormatDefaultValue(object? value, ITypeSymbol type)
     {
+        // Type parameters (T) can't accept literal null; use `default`.
+        if (type.TypeKind == TypeKind.TypeParameter)
+            return "default";
+
         if (value is null)
             return type.IsValueType && type.NullableAnnotation != NullableAnnotation.Annotated
                 ? "default"
                 : "null";
+
+        // Enums: Roslyn surfaces the value as the underlying integer. Without
+        // a cast or member-name lookup, the literal isn't convertible to the
+        // enum type. Cast via the fully-qualified enum type.
+        if (type.TypeKind == TypeKind.Enum)
+        {
+            var enumFqn = type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat);
+            return "(" + enumFqn + ")" + (value.ToString() ?? "0");
+        }
+
         if (value is string s)
             return "\"" + s.Replace("\\", "\\\\").Replace("\"", "\\\"") + "\"";
         if (value is bool b)

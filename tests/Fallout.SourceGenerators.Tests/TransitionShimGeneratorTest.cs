@@ -40,11 +40,22 @@ public class TransitionShimGeneratorTest
                     public class Nested { public Nested() {} }
                 }
 
-                // Hard tier — should be skipped with SHIM001
+                // Hard tier — sealed-class still skipped (deferred to session 2b)
                 public sealed class SealedThing { public SealedThing() {} }
-                public static class StaticHelpers { }
                 public enum MyEnum { A, B }
                 public class PrivateCtorOnly { private PrivateCtorOnly(string x) {} }
+
+                // Static-class with the various method shapes that need delegation
+                public static class StaticHelpers
+                {
+                    public static int Plain(int a) { return a; }
+                    public static void VoidReturn(string s) { }
+                    public static T Generic<T>(T input) where T : class { return input; }
+                    public static int WithOptional(int a, int b = 7, string s = "hello") { return a + b; }
+                    public static int Sum(params int[] nums) { return 0; }
+                    public static int TryParse(string s, out int value) { value = 0; return 0; }
+                    public static string AsHex(this byte b) { return b.ToString("x2"); }
+                }
             }
             """);
 
