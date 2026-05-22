@@ -18,6 +18,8 @@ internal class Solution(SolutionModel model, AbsolutePath path) : Fallout.Common
     public Fallout.Common.ProjectModel.Project Fallout_GlobalTool => this.GetProject("Fallout.GlobalTool");
     public Fallout.Common.ProjectModel.Project Fallout_GlobalTool_Tests => this.GetProject("Fallout.GlobalTool.Tests");
     public Fallout.Common.ProjectModel.Project Fallout_Migrate => this.GetProject("Fallout.Migrate");
+    public Fallout.Common.ProjectModel.Project Fallout_Migrate_Analyzers => this.GetProject("Fallout.Migrate.Analyzers");
+    public Fallout.Common.ProjectModel.Project Fallout_Migrate_Analyzers_Tests => this.GetProject("Fallout.Migrate.Analyzers.Tests");
     public Fallout.Common.ProjectModel.Project Fallout_Migrate_Tests => this.GetProject("Fallout.Migrate.Tests");
     public Fallout.Common.ProjectModel.Project Fallout_MSBuildTasks => this.GetProject("Fallout.MSBuildTasks");
     public Fallout.Common.ProjectModel.Project Fallout_ProjectModel => this.GetProject("Fallout.ProjectModel");
