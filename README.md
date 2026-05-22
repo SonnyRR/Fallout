@@ -2,6 +2,8 @@
   <img width="320" src=".assets/fallout-logo.svg" alt="Fallout — .NET build system" />
 </p>
 
+> 📦 **Fallout is the successor to NUKE.** [Migrating from NUKE →](docs/migration/from-nuke.md)
+
 # Fallout
 
 > Build automation for C#/.NET — the hard-fork successor to NUKE.

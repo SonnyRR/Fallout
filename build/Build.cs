@@ -136,7 +136,8 @@ partial class Build
 
     // Filter `Nuke.*` shim packages out of the nuget.org push — that ID is owned by
     // the original NUKE maintainer. The shims still build and pack as artifacts; they
-    // get pushed to GitHub Packages via a separate (manual / future-automated) step.
+    // are pushed to GitHub Packages by a follow-up step in .github/workflows/release.yml
+    // (#47).
     IEnumerable<AbsolutePath> IPublish.PushPackageFiles
         => From<IPack>().PackagesDirectory.GlobFiles("*.nupkg")
             .Where(x => !x.NameWithoutExtension.StartsWith("Nuke.", StringComparison.OrdinalIgnoreCase));

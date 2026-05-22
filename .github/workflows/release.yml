@@ -15,6 +15,7 @@ on:
 
 permissions:
   contents: write     # for ICreateGitHubRelease (tag + GitHub release)
+  packages: write     # for the Nuke.* transition-shim push to GH Packages (#47)
 
 jobs:
   release:
@@ -40,3 +41,24 @@ jobs:
           # repo Settings → Secrets and variables → Actions.
           NuGetApiKey: ${{ secrets.NUGET_API_KEY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Nuke.* transition-shim packages are intentionally filtered out of the
+      # main Publish step (see Build.cs PushPackageFiles) because that ID
+      # belongs to NUKE's original maintainer on nuget.org. We publish them
+      # here to GitHub Packages instead. #47.
+      - name: 'Publish: Nuke.* transition shims to GH Packages'
+        if: always()  # still push the shims even if a previous Fallout.* push transient-failed
+        run: |
+          shopt -s nullglob
+          shims=(output/packages/Nuke.*.nupkg)
+          if [ ${#shims[@]} -eq 0 ]; then
+            echo "No Nuke.* shim packages found in output/packages — skipping."
+            exit 0
+          fi
+          for pkg in "${shims[@]}"; do
+            echo "Pushing $pkg to GH Packages..."
+            dotnet nuget push "$pkg" \
+              --source "https://nuget.pkg.github.com/ChrisonSimtian/index.json" \
+              --api-key "${{ secrets.GITHUB_TOKEN }}" \
+              --skip-duplicate
+          done
